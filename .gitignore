@@ -1,0 +1,8 @@
+CLAUDE.md
+.venv/
+data/raw/
+data/processed/
+outputs/
+*.pt
+__pycache__/
+.DS_Store
