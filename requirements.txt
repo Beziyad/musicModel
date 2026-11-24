@@ -1,0 +1,2 @@
+miditok==3.1.0
+symusic==0.6.0
