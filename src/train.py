@@ -51,6 +51,10 @@ def main():
     p.add_argument("--eval-batches", type=int, default=20)
     p.add_argument("--no-augment", action="store_true", help="disable transposition")
     p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--resume", type=Path, default=None,
+                   help="checkpoint to continue from (weights + optimizer if saved)")
+    p.add_argument("--lr-min", type=float, default=None,
+                   help="if set, learning rate decays (cosine) from --lr to this value")
     args = p.parse_args()
 
     torch.manual_seed(args.seed)
@@ -62,17 +66,39 @@ def main():
     # AdamW: the algorithm that applies the corrections computed by backward().
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=0.01)
 
+    start_epoch, step = 0, 0
+    if args.resume:
+        ckpt = torch.load(args.resume)
+        model.load_state_dict(ckpt["model"])
+        if "optimizer" in ckpt:                      # older checkpoints did not save it
+            optimizer.load_state_dict(ckpt["optimizer"])
+            for g in optimizer.param_groups:
+                g["lr"] = lr
+        start_epoch, step = ckpt["epoch"], ckpt.get("step", 0)
+        print(f"Resumed from {args.resume} (epoch {start_epoch}, val loss {ckpt['val_loss']:.3f})")
+
     train, val = load_split("train"), load_split("validation")
     tokens_per_step = args.batch_size * cfg.block_size
     steps_per_epoch = math.ceil(len(train) / tokens_per_step)
+    total_steps = steps_per_epoch * args.epochs
+    if args.resume and step == 0:                    # older checkpoints did not save the step
+        step = start_epoch * steps_per_epoch
     n_params = sum(q.numel() for q in model.parameters())
-    print(f"{args.model}: {n_params:,d} params | lr {lr} | {steps_per_epoch} steps/epoch "
+    print(f"{args.model}: {n_params:,d} params | lr {lr}"
+          f"{f' -> {args.lr_min} (cosine)' if args.lr_min else ''} | {steps_per_epoch} steps/epoch "
           f"| augment {'off' if args.no_augment else 'on'}")
+
+    def lr_at(i: int) -> float:
+        """Cosine decay: big steps at first, smaller and smaller ones at the end."""
+        if args.lr_min is None:
+            return lr
+        return args.lr_min + 0.5 * (lr - args.lr_min) * (1 + math.cos(math.pi * i / total_steps))
 
     CKPT_DIR.mkdir(exist_ok=True)
     log_path = CKPT_DIR / f"{args.model}_log.csv"
-    with open(log_path, "w", newline="") as f:
-        csv.writer(f).writerow(["epoch", "step", "train_loss", "val_loss", "minutes"])
+    if not args.resume:                              # resume = keep the old lines
+        with open(log_path, "w", newline="") as f:
+            csv.writer(f).writerow(["epoch", "step", "train_loss", "val_loss", "minutes"])
 
     def log_eval(epoch: int, step: int, t0: float) -> float:
         tr = evaluate(model, train, cfg, args.eval_batches, args.batch_size)
@@ -84,10 +110,11 @@ def main():
         return va
 
     t0 = time.time()
-    best_val = log_eval(0, 0, t0)                  # epoch 0 = before any training
-    step = 0
-    for epoch in range(1, args.epochs + 1):
+    best_val = log_eval(start_epoch, step, t0)     # before this run's training
+    for epoch in range(start_epoch + 1, start_epoch + args.epochs + 1):
         for i in range(steps_per_epoch):
+            for g in optimizer.param_groups:
+                g["lr"] = lr_at((epoch - start_epoch - 1) * steps_per_epoch + i)
             x, y = get_batch(train, cfg.block_size, args.batch_size, augment=not args.no_augment)
             loss = loss_fn(model(x), y)            # 1. forward: how wrong are we?
             optimizer.zero_grad()
@@ -95,11 +122,13 @@ def main():
             optimizer.step()                       # 3. step: move them a little
             step += 1
             if i % 50 == 0:
-                print(f"  step {step:5d} | batch loss {loss.item():.3f}", flush=True)
+                print(f"  step {step:5d} | batch loss {loss.item():.3f} "
+                      f"| lr {optimizer.param_groups[0]['lr']:.2e}", flush=True)
 
         val_loss = log_eval(epoch, step, t0)
-        ckpt = {"model": model.state_dict(), "config": cfg.__dict__, "kind": args.model,
-                "epoch": epoch, "val_loss": val_loss}
+        ckpt = {"model": model.state_dict(), "optimizer": optimizer.state_dict(),
+                "config": cfg.__dict__, "kind": args.model,
+                "epoch": epoch, "step": step, "val_loss": val_loss}
         torch.save(ckpt, CKPT_DIR / f"{args.model}_epoch{epoch:02d}.pt")
         if val_loss < best_val:
             best_val = val_loss
